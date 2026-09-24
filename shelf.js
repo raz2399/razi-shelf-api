@@ -9,6 +9,7 @@
 const express = require('express');
 const { types } = require('pg');
 const { applyRules, setLocation, decideSuggestion } = require('./locations');
+const { candidates, upcKey } = require('./upc');
 
 const CHUNK = 2000;
 
@@ -49,6 +50,23 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   const dateOf = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null;
   const money = v => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; };
   const bad = (res, msg) => res.status(400).json({ error: msg });
+
+  // Find an item from any spelling of its barcode: with or without the check
+  // digit, EAN-13, GTIN-14 or UPC-E. Best reading first, first hit wins.
+  async function findItem(storeId, code) {
+    const c = candidates(code);
+    if (!c.raws.length && !c.keys.length) return null;
+    const { rows } = await pool.query(
+      `SELECT i.*, si.retail,
+              COALESCE(array_position($2::text[], i.upc), 99)
+            + COALESCE(array_position($3::text[], i.upc_key), 99) AS rank
+         FROM items i
+         LEFT JOIN store_items si ON si.store_id = $1 AND si.upc = i.upc
+        WHERE i.upc = ANY($2::text[]) OR i.upc_key = ANY($3::text[])
+        ORDER BY rank LIMIT 1`,
+      [storeId, c.raws, c.keys]);
+    return rows[0] || null;
+  }
 
   // ---------- resolve the store and its local "today" ----------
   r.param('store', (req, res, next, code) => (async () => {
@@ -130,17 +148,16 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   }));
 
   r.get('/s/:store/items/:upc', wrap(async (req, res) => {
-    const upc = upcOf(req.params.upc);
-    if (!upc) return bad(res, 'bad upc');
+    const found = await findItem(req.store.id, req.params.upc);
+    if (!found) return res.status(404).json({ error: 'not in item file', upc: str(req.params.upc, 20) });
     const { rows } = await pool.query(
-      `SELECT i.upc, i.description, i.size, i.pack, i.dept, si.retail,
+      `SELECT i.upc, i.upc_key, i.description, i.size, i.pack, i.dept, si.retail,
               l.zone_code, l.source, l.section, l.shelf, z.aisle, z.side, z.name AS zone_name
          FROM items i
          LEFT JOIN store_items si   ON si.store_id = $1 AND si.upc = i.upc
          LEFT JOIN item_locations l ON l.store_id = $1 AND l.upc = i.upc
          LEFT JOIN zones z          ON z.store_id = $1 AND z.code = l.zone_code
-        WHERE i.upc = $2`, [req.store.id, upc]);
-    if (!rows.length) return res.status(404).json({ error: 'not in item file', upc });
+        WHERE i.upc = $2`, [req.store.id, found.upc]);
     res.json({ item: rows[0] });
   }));
 
@@ -177,12 +194,13 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   }));
 
   r.post('/s/:store/deals/plan', wrap(async (req, res) => {
-    const upc = upcOf(req.body.upc), starts = dateOf(req.body.starts), ends = dateOf(req.body.ends);
+    const starts = dateOf(req.body.starts), ends = dateOf(req.body.ends);
     const price = money(req.body.sale_price), actor = str(req.body.actor, 60);
-    if (!upc || !starts || !ends || !price || !actor) return bad(res, 'upc, starts, ends, sale_price, actor required');
+    if (!req.body.upc || !starts || !ends || !price || !actor) return bad(res, 'upc, starts, ends, sale_price, actor required');
     if (ends < starts) return bad(res, 'ends before starts');
-    const it = await pool.query('SELECT 1 FROM items WHERE upc = $1', [upc]);
-    if (!it.rowCount) return res.status(404).json({ error: 'not in item file', upc });
+    const found = await findItem(req.store.id, req.body.upc);
+    if (!found) return res.status(404).json({ error: 'not in item file', upc: str(req.body.upc, 20) });
+    const upc = found.upc;
     const { rows } = await pool.query(
       `INSERT INTO deals (store_id, upc, deal_type, starts, ends, sale_price, source, created_by)
        VALUES ($1,$2,'AD',$3,$4,$5,'ad_plan',$6)
@@ -246,7 +264,7 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
     const zone = str(req.params.zone, 10).toUpperCase();
     const { rows } = await pool.query(
       `WITH w AS (${WINDOW}), u AS (SELECT DISTINCT upc FROM w)
-       SELECT u.upc, i.description, i.size, si.retail, l.source, l.verified_by, l.verified_at
+       SELECT u.upc, i.upc_key, i.description, i.size, si.retail, l.source, l.verified_by, l.verified_at
          FROM u
          JOIN item_locations l ON l.store_id = $1 AND l.upc = u.upc AND l.zone_code = $5
          LEFT JOIN items i ON i.upc = u.upc
@@ -257,11 +275,12 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   }));
 
   r.post('/s/:store/locations/scan', wrap(async (req, res) => {
-    const upc = upcOf(req.body.upc), zone = str(req.body.zone, 10).toUpperCase(), actor = str(req.body.actor, 60);
-    if (!upc || !zone || !actor) return bad(res, 'upc, zone, actor required');
-    const it = await pool.query(
-      `SELECT i.description, i.size FROM items i WHERE i.upc = $1`, [upc]);
-    if (!it.rowCount) return res.status(404).json({ error: 'not in item file', upc });
+    const zone = str(req.body.zone, 10).toUpperCase(), actor = str(req.body.actor, 60);
+    if (!req.body.upc || !zone || !actor) return bad(res, 'upc, zone, actor required');
+    const found = await findItem(req.store.id, req.body.upc);
+    if (!found) return res.status(404).json({ error: 'not in item file', upc: str(req.body.upc, 20) });
+    const upc = found.upc;
+    const it = { rows: [{ description: found.description, size: found.size }] };
     const out = await setLocation(pool, { storeId: req.store.id, upc, zone, source: 'scan', actor,
       device: str(req.body.device, 60), clientId: str(req.body.client_id, 80) || null,
       section: str(req.body.section, 10), shelf: str(req.body.shelf, 10) });
@@ -270,10 +289,11 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   }));
 
   r.post('/s/:store/locations/correct', wrap(async (req, res) => {
-    const upc = upcOf(req.body.upc), zone = str(req.body.zone, 10).toUpperCase(), actor = str(req.body.actor, 60);
-    if (!upc || !zone || !actor) return bad(res, 'upc, zone, actor required');
-    const it = await pool.query('SELECT 1 FROM items WHERE upc = $1', [upc]);
-    if (!it.rowCount) return res.status(404).json({ error: 'not in item file', upc });
+    const zone = str(req.body.zone, 10).toUpperCase(), actor = str(req.body.actor, 60);
+    if (!req.body.upc || !zone || !actor) return bad(res, 'upc, zone, actor required');
+    const found = await findItem(req.store.id, req.body.upc);
+    if (!found) return res.status(404).json({ error: 'not in item file', upc: str(req.body.upc, 20) });
+    const upc = found.upc;
     const out = await setLocation(pool, { storeId: req.store.id, upc, zone, source: 'correction', actor,
       device: str(req.body.device, 60), note: str(req.body.note, 200), clientId: str(req.body.client_id, 80) || null });
     if (out.error) return res.status(out.status).json(out);
@@ -314,7 +334,7 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
         FROM open o
        ORDER BY o.upc, o.action, CASE WHEN o.action = 'hang' THEN o.ends END DESC NULLS LAST, o.ends DESC
     )
-    SELECT card.*, i.description, i.size, si.retail,
+    SELECT card.*, i.description, i.size, i.upc_key, si.retail,
            COALESCE(l.zone_code, '?') AS zone_code, l.source AS loc_source, l.section, l.shelf
       FROM card
       LEFT JOIN items i          ON i.upc = card.upc
@@ -377,10 +397,52 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
     res.json({ ok: true, recorded: done.rowCount, location });
   }));
 
+  // "We already did these." Marks open work as handled without pretending it
+  // was scanned. Every row carries who, when and one batch id so it can be undone.
+  r.post('/s/:store/work/bulk', wrap(async (req, res) => {
+    const s = req.store, actor = str(req.body.actor, 60);
+    const zone = str(req.body.zone, 10).toUpperCase();
+    const action = str(req.body.action, 5);
+    const through = dateOf(req.body.through);
+    const note = str(req.body.note, 120) || 'marked already handled';
+    if (!actor) return bad(res, 'actor required');
+    if (action && !['hang', 'pull'].includes(action)) return bad(res, 'action must be hang or pull');
+    const batch = 'b-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+    const { rows } = await pool.query(
+      `INSERT INTO tag_work (store_id, deal_id, action, status, reason, verified, zone_code, actor, device, batch_id)
+       SELECT $1, q.deal_id, q.action, 'done', $5, FALSE, q.zone_code, $6, $7, $8
+         FROM (${OPEN_WORK}) q
+        WHERE ($4::text IS NULL OR q.zone_code = $4)
+          AND ($9::text IS NULL OR q.action = $9)
+          AND ($10::date IS NULL OR q.ends <= $10::date)
+       ON CONFLICT (deal_id, action) DO NOTHING
+       RETURNING deal_id`,
+      [s.id, s.floor, s.today, zone || null, note, actor, str(req.body.device, 60), batch,
+       action || null, through]);
+    res.json({ ok: true, marked: rows.length, batch_id: batch });
+  }));
+
+  r.post('/s/:store/work/bulk/undo', wrap(async (req, res) => {
+    const batch = str(req.body.batch_id, 40);
+    if (!batch) return bad(res, 'batch_id required');
+    const { rowCount } = await pool.query(
+      'DELETE FROM tag_work WHERE store_id = $1 AND batch_id = $2', [req.store.id, batch]);
+    res.json({ ok: true, undone: rowCount });
+  }));
+
+  r.get('/s/:store/work/bulk/recent', wrap(async (req, res) => {
+    const { rows } = await pool.query(
+      `SELECT batch_id, MIN(at) AS at, MAX(actor) AS actor, COUNT(*)::int AS n,
+              MAX(reason) AS note, STRING_AGG(DISTINCT zone_code, ',') AS zones
+         FROM tag_work WHERE store_id = $1 AND batch_id IS NOT NULL
+        GROUP BY batch_id ORDER BY MIN(at) DESC LIMIT 10`, [req.store.id]);
+    res.json({ batches: rows });
+  }));
+
   r.post('/s/:store/signoff', wrap(async (req, res) => {
     const actor = str(req.body.actor, 60), qr = str(req.body.qr, 80), kind = str(req.body.kind, 10) || 'tags';
     if (!actor || !qr) return bad(res, 'actor and qr required');
-    if (!['tags', 'confirm', 'sweep'].includes(kind)) return bad(res, 'bad kind');
+    if (!['start', 'tags', 'confirm', 'sweep'].includes(kind)) return bad(res, 'bad kind');
     const z = await pool.query('SELECT code FROM zones WHERE store_id = $1 AND qr_code = $2 AND active', [req.store.id, qr]);
     if (!z.rowCount) return res.status(404).json({ error: 'that card is not an aisle card for this store' });
     const expect = str(req.body.zone, 10).toUpperCase();

@@ -21,6 +21,7 @@ async function migrate() {
   const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM stores');
   if (rows[0].n === 0) { await run('002_seed_lindsay.sql'); console.log('seeded first store'); }
   await run('003_new_store.sql');
+  await run('004_upc_and_bulk.sql');
   const v = await pool.query('SELECT MAX(version) AS v FROM schema_version');
   console.log('database ready, schema v' + v.rows[0].v);
 }
