@@ -171,7 +171,8 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
     for (let i = 0; i < list.length; i += CHUNK) {
       const part = list.slice(i, i + CHUNK)
         .map(x => ({ upc: upcOf(x.upc), t: str(x.deal_type, 8).toUpperCase(), s: dateOf(x.starts),
-                     e: dateOf(x.ends), p: money(x.sale_price), v: str(x.vendor, 30) }))
+                     e: dateOf(x.ends), p: money(x.sale_price), v: str(x.vendor, 30),
+                     q: Math.min(Math.max(parseInt(x.qty, 10) || 1, 1), 99) }))
         .filter(x => x.upc && x.t && x.e);
       const uniq = [...new Map(part.map(x => [[x.upc, x.t, x.s, x.e].join('|'), x])).values()];
       part.length = 0; part.push(...uniq);
@@ -179,13 +180,15 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
       part.forEach(x => upcs.add(x.upc));
       const cols = k => part.map(x => x[k]);
       await pool.query(
-        `INSERT INTO deals (store_id, upc, deal_type, starts, ends, sale_price, vendor, source)
-         SELECT $1, u, t, s, e, p, v, 'brdata'
-           FROM UNNEST($2::text[], $3::text[], $4::date[], $5::date[], $6::numeric[], $7::text[]) AS x(u,t,s,e,p,v)
+        `INSERT INTO deals (store_id, upc, deal_type, starts, ends, sale_price, vendor, qty, source)
+         SELECT $1, u, t, s, e, p, v, q, 'brdata'
+           FROM UNNEST($2::text[], $3::text[], $4::date[], $5::date[], $6::numeric[], $7::text[], $8::int[]) AS x(u,t,s,e,p,v,q)
          ON CONFLICT (store_id, upc, deal_type, starts, ends) DO UPDATE
-           SET sale_price = EXCLUDED.sale_price, vendor = EXCLUDED.vendor
-         WHERE deals.sale_price IS DISTINCT FROM EXCLUDED.sale_price OR deals.vendor IS DISTINCT FROM EXCLUDED.vendor`,
-        [req.store.id, cols('upc'), cols('t'), cols('s'), cols('e'), cols('p'), cols('v')]
+           SET sale_price = EXCLUDED.sale_price, vendor = EXCLUDED.vendor, qty = EXCLUDED.qty
+         WHERE deals.sale_price IS DISTINCT FROM EXCLUDED.sale_price
+            OR deals.vendor IS DISTINCT FROM EXCLUDED.vendor
+            OR deals.qty IS DISTINCT FROM EXCLUDED.qty`,
+        [req.store.id, cols('upc'), cols('t'), cols('s'), cols('e'), cols('p'), cols('v'), cols('q')]
       );
       n += part.length;
     }
@@ -196,23 +199,26 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   r.post('/s/:store/deals/plan', wrap(async (req, res) => {
     const starts = dateOf(req.body.starts), ends = dateOf(req.body.ends);
     const price = money(req.body.sale_price), actor = str(req.body.actor, 60);
+    const qty = Math.min(Math.max(parseInt(req.body.qty, 10) || 1, 1), 99);
     if (!req.body.upc || !starts || !ends || !price || !actor) return bad(res, 'upc, starts, ends, sale_price, actor required');
     if (ends < starts) return bad(res, 'ends before starts');
     const found = await findItem(req.store.id, req.body.upc);
     if (!found) return res.status(404).json({ error: 'not in item file', upc: str(req.body.upc, 20) });
     const upc = found.upc;
     const { rows } = await pool.query(
-      `INSERT INTO deals (store_id, upc, deal_type, starts, ends, sale_price, source, created_by)
-       VALUES ($1,$2,'AD',$3,$4,$5,'ad_plan',$6)
-       ON CONFLICT (store_id, upc, deal_type, starts, ends) DO UPDATE SET sale_price = EXCLUDED.sale_price
-       RETURNING id`, [req.store.id, upc, starts, ends, price, actor]);
+      `INSERT INTO deals (store_id, upc, deal_type, starts, ends, sale_price, qty, source, created_by)
+       VALUES ($1,$2,'AD',$3,$4,$5,$7,'ad_plan',$6)
+       ON CONFLICT (store_id, upc, deal_type, starts, ends) DO UPDATE
+         SET sale_price = EXCLUDED.sale_price, qty = EXCLUDED.qty
+       RETURNING id`, [req.store.id, upc, starts, ends, price, actor, qty]);
     await applyRules(pool, req.store.id, [upc]);
     res.json({ ok: true, id: rows[0].id });
   }));
 
   r.get('/s/:store/deals/planned', wrap(async (req, res) => {
     const { rows } = await pool.query(
-      `SELECT d.id, d.upc, d.starts, d.ends, d.sale_price, d.created_by, i.description, i.size, si.retail,
+      `SELECT d.id, d.upc, d.starts, d.ends, d.sale_price, d.qty,
+              shelf_unit_price(d.sale_price, d.qty) AS unit_price, d.created_by, i.description, i.size, si.retail,
               l.zone_code, z.aisle, z.side
          FROM deals d
          JOIN items i ON i.upc = d.upc
@@ -227,7 +233,8 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
   r.get('/s/:store/expiring', wrap(async (req, res) => {
     const days = Math.min(Math.max(parseInt(req.query.days || '7', 10), 1), 60);
     const { rows } = await pool.query(
-      `SELECT d.upc, d.deal_type, d.ends, d.sale_price, i.description, i.size, si.retail,
+      `SELECT d.upc, d.deal_type, d.starts, d.ends, d.sale_price, d.qty,
+              shelf_unit_price(d.sale_price, d.qty) AS unit_price, i.description, i.size, si.retail,
               l.zone_code, l.source, z.aisle, z.side, z.walk_order
          FROM deals d
          LEFT JOIN items i          ON i.upc = d.upc
@@ -330,7 +337,8 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
        WHERE NOT EXISTS (SELECT 1 FROM tag_work t WHERE t.deal_id = c.id AND t.action = c.action)
     ), card AS (
       SELECT DISTINCT ON (o.upc, o.action)
-             o.upc, o.action, o.deal_type, o.starts, o.ends, o.sale_price, o.id AS deal_id
+             o.upc, o.action, o.deal_type, o.starts, o.ends, o.sale_price, o.qty,
+             shelf_unit_price(o.sale_price, o.qty) AS unit_price, o.source AS deal_source, o.id AS deal_id
         FROM open o
        ORDER BY o.upc, o.action, CASE WHEN o.action = 'hang' THEN o.ends END DESC NULLS LAST, o.ends DESC
     )
@@ -511,7 +519,8 @@ module.exports = function shelfRouter({ pool, token = process.env.SHELF_API_TOKE
     const s = req.store;
     const { rows } = await pool.query(
       `WITH w AS (${WINDOW})
-       SELECT w.upc, w.deal_type, w.starts, w.ends, w.sale_price, w.vendor, w.source AS deal_source,
+       SELECT w.upc, w.deal_type, w.starts, w.ends, w.sale_price, w.qty,
+              shelf_unit_price(w.sale_price, w.qty) AS unit_price, w.vendor, w.source AS deal_source,
               (w.ends - $3::date) AS days,
               i.description, i.size, i.pack, i.dept, si.retail,
               l.zone_code, l.source AS loc_source, z.aisle, z.side, z.name AS zone_name, z.walk_order,
